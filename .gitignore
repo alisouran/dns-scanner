@@ -1,0 +1,6 @@
+.env
+scan_*.csv
+working-dns*.txt
+dnstt-client*
+irdns.txt
+pydns-scanner-macos
