@@ -196,7 +196,7 @@ check_dns() {
     if [ "$ssh_success" = true ]; then
         echo "${dns}|CLEAN|${latency_ms}" > "$result_file"
         # Immediately print to terminal and append to output file (serialized via lock)
-        print_clean_result "$dns" "$latency_ms"
+        print_clean_result "\`$dns\`" "$latency_ms"
     elif [ "$stream_created" = true ]; then
         # Stream was created but SSH failed -- DPI is interfering
         echo "${dns}|BLOCKED_BY_DPI|${latency_ms}" > "$result_file"
@@ -286,7 +286,7 @@ if [ "${#DNS_SERVERS[@]}" -eq 0 ]; then
 fi
 
 # Safety prompt: confirm before launching massive scans
-if [ "${#DNS_SERVERS[@]}" -gt 1000 ]; then
+if [ "${#DNS_SERVERS[@]}" -gt 100000 ]; then
     printf "WARNING: %d IPs to scan. This will take a long time.\n" "${#DNS_SERVERS[@]}"
     printf "Continue? [y/N] "
     read -r confirm

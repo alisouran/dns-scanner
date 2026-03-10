@@ -9,7 +9,9 @@ them by status.
 
 ## How It Works
 
-1. Reads a list of DNS server IPs from a file (CSV or TXT format)
+1. Reads a list of DNS server IPs or CIDR ranges from a file (CSV or TXT format)
+   and automatically expands any CIDR notation (e.g., `10.0.0.0/24`) into
+   individual host IPs
 2. For each DNS server, launches a parallel worker that:
    - Starts a `dnstt-client` instance pointing at the DNS server
    - Attempts an SSH connection through the tunnel
@@ -25,6 +27,8 @@ them by status.
 ## Prerequisites
 
 - macOS (tested on ARM64) or Linux
+- Python 3 (pre-installed on macOS and most Linux distributions; used for CIDR
+  expansion)
 - SSH client (pre-installed on macOS and most Linux distributions)
 - A running dnstt server with its public key
 
@@ -117,8 +121,9 @@ have limited resources. |
 
 ### Step 4: Prepare Your DNS List
 
-Create a file with the DNS server IPs you want to test. Two formats are
-supported:
+Create a file with the DNS server IPs or CIDR ranges you want to test. Both
+individual IPs and CIDR notation are supported — CIDR ranges are automatically
+expanded into individual host IPs at startup. Two file formats are supported:
 
 **💡 Pro Tip: Finding DNS Servers** If you don't already have a list of DNS
 servers, you can first use a tool like
@@ -127,18 +132,19 @@ PYDNS-Scanner generates a `.csv` file as its output. You can simply copy that
 exact CSV file into the root of this project and use it as your `DNS_LIST_FILE`
 without making any modifications!
 
-**TXT format** - one IP per line, `#` comments supported:
+**TXT format** - one IP or CIDR range per line, `#` comments supported:
 
 ```
 8.8.8.8
 1.1.1.1
+10.0.0.0/24
 # This is a comment
-9.9.9.9
+172.16.0.0/28
 
 ```
 
-**CSV format** - IP in the first column, first row is treated as a header and
-skipped:
+**CSV format** - IP/CIDR in the first column, first row is treated as a header
+and skipped:
 
 ```csv
 ip,provider,country
@@ -157,27 +163,28 @@ chmod +x dns-scanner.sh
 
 ```
 
-The scanner will test each DNS server and show results in the terminal with
-color-coded statuses. Each scan creates a new timestamped output file (e.g.
+The scanner will show a live progress bar and print clean results in real time
+with color-coded latency. Each scan creates a new timestamped output file (e.g.
 `working-dns_2026-03-04_16-30-00.txt`) so your previous results are always
-preserved.
+preserved. Results are sorted by latency (fastest first).
 
 ## Output Example
 
 ```
+Expanding 150 entries (CIDR ranges -> individual IPs)...
 ==================================================
-  DNSTT Scanner (Parallel | Max 5 workers)
+  DNSTT Scanner (Parallel | Max 50 workers)
 ==================================================
-  DNS list : dns-list.txt (3 servers)
+  DNS list : dns-list.txt (1200 servers)
   Output   : working-dns_2026-03-04_16-30-00.txt
 ==================================================
 
- [ CLEAN ] 8.8.8.8
- [ BLOCKED BY DPI ] 1.1.1.1
- [ DEAD ] 9.9.9.9
+ [ CLEAN ] 8.8.8.8 - 320ms
+ [ CLEAN ] 9.9.9.9 - 870ms
+[########------------] 40% (480/1200) | Running...
 
 ==================================================
-  Done! 1/3 servers are clean.
+  Done! 2/1200 servers are clean.
   Working DNS saved to: working-dns_2026-03-04_16-30-00.txt
 ==================================================
 
