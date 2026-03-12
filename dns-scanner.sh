@@ -20,7 +20,9 @@ done
 # Defaults for optional variables
 MAX_WAIT_TIME="${MAX_WAIT_TIME:-45}"
 SCAN_TIMESTAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
-OUTPUT_FILE="${OUTPUT_FILE:-working-dns_${SCAN_TIMESTAMP}.txt}"
+RESULT_DIR="dns-result"
+mkdir -p "$RESULT_DIR"
+OUTPUT_FILE="${OUTPUT_FILE:-${RESULT_DIR}/working-dns_${SCAN_TIMESTAMP}.txt}"
 BASE_PORT="${BASE_PORT:-10000}"
 MAX_PARALLEL="${MAX_PARALLEL:-5}"
 
@@ -337,9 +339,12 @@ kill "$progress_pid" 2>/dev/null
 wait "$progress_pid" 2>/dev/null
 printf "\r\e[K"
 
-# Sort output file by latency ascending (field 2: "IP Xms", sort -n ignores "ms" suffix)
+# Sort output file by latency ascending and remove duplicate DNS entries (keep last/highest ping)
 if [ -f "$OUTPUT_FILE" ]; then
     sort -t' ' -k2 -n -o "$OUTPUT_FILE" "$OUTPUT_FILE"
+    # Deduplicate: awk overwrites each DNS with its last (highest latency) line, then re-sort
+    awk '{data[$1]=$0} END {for (k in data) print data[k]}' "$OUTPUT_FILE" \
+        | sort -t' ' -k2 -n > "${OUTPUT_FILE}.tmp" && mv "${OUTPUT_FILE}.tmp" "$OUTPUT_FILE"
 fi
 
 # Count clean results from the output file
