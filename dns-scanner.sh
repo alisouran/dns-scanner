@@ -228,26 +228,34 @@ check_dns() {
     local start_ms
     start_ms=$(get_ms)
 
-    ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no \
+    # Use -v so SSH logs the remote server's version banner ("Remote protocol version"),
+    # which is the only reliable indicator that the DNS tunnel is actually working
+    # end-to-end. "begin stream" in the dnstt log is NOT usable — it fires the instant
+    # SSH connects to the LOCAL dnstt listener port (always, even for dead servers).
+    ssh -v -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no \
         -p "$port" "${SSH_USER}@127.0.0.1" > "$ssh_log" 2>&1 &
     ssh_pid=$!
 
     # 5. Two-phase adaptive timeout for faster scanning.
-    #    Phase 1: Wait for dnstt stream creation (STREAM_TIMEOUT seconds).
-    #    Phase 2: If stream created, wait for SSH auth response (AUTH_TIMEOUT seconds).
+    #    Phase 1: Wait for the remote SSH server banner to appear in the verbose log.
+    #             This proves data has flowed all the way through the DNS tunnel and back.
+    #             If no banner within STREAM_TIMEOUT → server is DEAD (fast-fail, skip Phase 2).
+    #    Phase 2: Tunnel confirmed → wait for SSH auth response (AUTH_TIMEOUT seconds).
     local ssh_success=false
-    local stream_created=false
+    local tunnel_ok=false
 
-    # Phase 1: Wait for stream creation
+    # Phase 1: Wait for end-to-end tunnel confirmation (remote server banner)
     local elapsed=0
     while [ "$elapsed" -lt "$STREAM_TIMEOUT" ]; do
-        # Check for early SSH success (fast servers may respond before stream detection)
+        # Fast path: auth response already present (very fast tunnels)
         if grep -qE "Permission denied|publickey,password" "$ssh_log" 2>/dev/null; then
             ssh_success=true
             break
         fi
-        if grep -q "begin stream" "$dnstt_log" 2>/dev/null; then
-            stream_created=true
+        # "Remote protocol version" appears in SSH verbose output only when the remote
+        # SSH server's banner has been received — proof that the full tunnel works.
+        if grep -q "Remote protocol version" "$ssh_log" 2>/dev/null; then
+            tunnel_ok=true
             break
         fi
         # Fail-fast: both processes died
@@ -258,8 +266,8 @@ check_dns() {
         elapsed=$((elapsed + 1))
     done
 
-    # Phase 2: Stream created — wait for SSH auth (shorter deadline)
-    if [ "$stream_created" = true ] && [ "$ssh_success" != true ]; then
+    # Phase 2: Tunnel confirmed — wait for SSH auth response
+    if [ "$tunnel_ok" = true ] && [ "$ssh_success" != true ]; then
         local auth_elapsed=0
         while [ "$auth_elapsed" -lt "$AUTH_TIMEOUT" ]; do
             if grep -qE "Permission denied|publickey,password" "$ssh_log" 2>/dev/null; then
@@ -304,9 +312,10 @@ random.shuffle(ips)
 for ip in ips[:50]: print(ip)
 " >> "$WORK_DIR/dynamic_queue.txt" 2>/dev/null
             fi
-        elif [ "$stream_created" = true ]; then
+        elif [ "$tunnel_ok" = true ]; then
             status="BLOCKED_BY_DPI"
-            # Stream was created but SSH failed -- DPI is interfering
+            # Tunnel was confirmed (server banner received) but SSH auth never completed —
+            # the DNS server forwards dnstt traffic but something is blocking SSH auth.
             echo "${dns}|BLOCKED_BY_DPI|${latency_ms}|${proto}" > "$result_file"
         else
             # No stream: DNS server is completely unreachable
@@ -461,14 +470,45 @@ if [ -f "$DEAD_CACHE" ]; then
     rm -f "$_dead_valid"
 fi
 
-# --- Pre-filter: quickly eliminate IPs that don't respond ---
-# For "dot" mode, skip UDP pre-filter (port 853 check is done via TCP below)
-# For "udp" or "both" mode, run UDP pre-filter on port 53
+# --- Pre-filter: quickly eliminate IPs that don't respond on port 53 ---
+# For "dot" mode, skip UDP pre-filter (port 853 is checked differently)
+# Results are cached to avoid re-probing on every run
+PREFILTER_CACHE="${PREFILTER_CACHE:-${RESULT_DIR}/prefilter_cache.txt}"
+PREFILTER_CACHE_MAX_AGE="${PREFILTER_CACHE_MAX_AGE:-21600}"  # Default: 6 hours
+
 if [ "$PREFILTER" = "true" ] && [ "$SCAN_MODE" != "dot" ]; then
     pre_total=$ip_count
-    printf "Pre-filtering %d IPs (UDP port 53 probe, %ss timeout)...\n" "$pre_total" "$PREFILTER_TIMEOUT"
+    _use_cache=false
 
-    python3 -c "
+    # Check if a fresh pre-filter cache exists
+    if [ -f "$PREFILTER_CACHE" ]; then
+        _cache_ts=$(head -1 "$PREFILTER_CACHE" 2>/dev/null)
+        if [ -n "$_cache_ts" ] && [ "$_cache_ts" -gt 0 ] 2>/dev/null; then
+            _cache_age=$(( $(date +%s) - _cache_ts ))
+            if [ "$_cache_age" -lt "$PREFILTER_CACHE_MAX_AGE" ]; then
+                _use_cache=true
+                _cache_age_min=$(( _cache_age / 60 ))
+                printf "Using cached pre-filter results (%d min old, max %dh).\n" \
+                    "$_cache_age_min" "$(( PREFILTER_CACHE_MAX_AGE / 3600 ))"
+            fi
+        fi
+    fi
+
+    if [ "$_use_cache" = true ]; then
+        # Intersect: keep only IPs that are both in our IP_FILE and in the cache
+        # Cache format: line 1 = timestamp, lines 2+ = IPs
+        _cache_ips=$(mktemp)
+        tail -n +2 "$PREFILTER_CACHE" | sort -u > "$_cache_ips"
+        sort -o "$IP_FILE" "$IP_FILE"
+        comm -12 "$IP_FILE" "$_cache_ips" > "${IP_FILE}.tmp"
+        mv "${IP_FILE}.tmp" "$IP_FILE"
+        rm -f "$_cache_ips"
+        ip_count=$(wc -l < "$IP_FILE" | tr -d ' ')
+        printf "Pre-filter (cached): %d/%d IPs known responsive on port 53\n" "$ip_count" "$pre_total"
+    else
+        printf "Pre-filtering %d IPs (UDP port 53 probe, %ss timeout)...\n" "$pre_total" "$PREFILTER_TIMEOUT"
+
+        python3 -c "
 import socket, select, struct, sys, time
 
 def build_dns_query(domain='google.com'):
@@ -479,8 +519,9 @@ def build_dns_query(domain='google.com'):
     qname += b'\x00'
     return header + qname + struct.pack('>HH', 1, 1)
 
-timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
-query = build_dns_query()
+timeout    = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
+cache_path = sys.argv[3]         if len(sys.argv) > 3 else ''
+query      = build_dns_query()
 
 with open(sys.argv[1]) as f:
     ips = [line.strip() for line in f if line.strip()]
@@ -490,8 +531,8 @@ alive = set()
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setblocking(False)
 try:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
 except Exception:
     pass
 
@@ -506,8 +547,19 @@ def drain_responses():
         except Exception:
             break
 
-# Send in batches of 300 with small delays to avoid overwhelming the socket buffer
-BATCH_SIZE = 300
+def write_cache(path, ips_set):
+    if not path:
+        return
+    try:
+        with open(path, 'w') as f:
+            f.write(str(int(time.time())) + '\n')
+            for ip in ips_set:
+                f.write(ip + '\n')
+    except Exception:
+        pass
+
+# Send in batches; larger batch size reduces per-batch sleep overhead significantly
+BATCH_SIZE = 2000
 sent = 0
 total = len(ips)
 for i in range(0, total, BATCH_SIZE):
@@ -519,40 +571,35 @@ for i in range(0, total, BATCH_SIZE):
             pass
     sent += len(batch)
     drain_responses()
-    # Progress feedback every 10K IPs
-    if sent % 10000 < BATCH_SIZE:
+    if sent % 20000 < BATCH_SIZE:
         sys.stderr.write(f'\r  Sent {sent}/{total} probes, {len(alive)} responses so far...')
         sys.stderr.flush()
-    time.sleep(0.05)
+    time.sleep(0.02)
 
-sys.stderr.write(f'\r  Sent {total}/{total} probes, waiting for responses...          \n')
+sys.stderr.write(f'\r  Sent {total}/{total} probes. Waiting {timeout:.0f}s for remaining responses...\n')
 sys.stderr.flush()
 
-# Second pass: re-send to IPs that haven't responded yet (packet loss recovery)
-not_seen = [ip for ip in ips if ip not in alive]
-for i in range(0, len(not_seen), BATCH_SIZE):
-    batch = not_seen[i:i+BATCH_SIZE]
-    for ip in batch:
-        try:
-            sock.sendto(query, (ip, 53))
-        except Exception:
-            pass
-    drain_responses()
-    time.sleep(0.05)
+# Save preliminary cache right after sending so Ctrl+C during collection still persists results
+write_cache(cache_path, alive)
 
-# Collect remaining responses until timeout
+# Collect remaining responses with a visible countdown so the terminal does not appear frozen
 deadline = time.time() + timeout
-while time.time() < deadline:
+while True:
     remaining = deadline - time.time()
     if remaining <= 0:
         break
-    ready, _, _ = select.select([sock], [], [], min(remaining, 0.05))
+    sys.stderr.write(f'\r  Collecting responses... {remaining:.1f}s remaining, {len(alive)} alive so far...')
+    sys.stderr.flush()
+    ready, _, _ = select.select([sock], [], [], min(remaining, 0.5))
     if ready:
         try:
             data, addr = sock.recvfrom(512)
             alive.add(addr[0])
         except Exception:
             pass
+
+sys.stderr.write(f'\r  Done collecting. {len(alive)} IPs responded on port 53.                        \n')
+sys.stderr.flush()
 
 sock.close()
 
@@ -561,25 +608,29 @@ out_path = sys.argv[1] + '.alive'
 with open(out_path, 'w') as f:
     for ip in alive:
         f.write(ip + '\n')
-" "$IP_FILE" "$PREFILTER_TIMEOUT"
 
-    if [ -f "${IP_FILE}.alive" ]; then
-        pre_alive=$(wc -l < "${IP_FILE}.alive" | tr -d ' ')
-    else
-        pre_alive=0
-    fi
-    pre_filtered=$((pre_total - pre_alive))
-    printf "Pre-filter: %d/%d IPs respond on port 53 (%d filtered out, %.0f%% reduction)\n" \
-        "$pre_alive" "$pre_total" "$pre_filtered" \
-        "$(python3 -c "print(${pre_filtered}/${pre_total}*100 if ${pre_total}>0 else 0)")"
+# Overwrite cache with final complete result set
+write_cache(cache_path, alive)
+" "$IP_FILE" "$PREFILTER_TIMEOUT" "$PREFILTER_CACHE"
 
-    if [ "$pre_alive" -eq 0 ]; then
-        printf "Warning: No IPs responded to DNS pre-filter. Running full scan instead.\n"
-    else
-        mv "${IP_FILE}.alive" "$IP_FILE"
-        ip_count=$pre_alive
+        if [ -f "${IP_FILE}.alive" ]; then
+            pre_alive=$(wc -l < "${IP_FILE}.alive" | tr -d ' ')
+        else
+            pre_alive=0
+        fi
+        pre_filtered=$((pre_total - pre_alive))
+        printf "Pre-filter: %d/%d IPs respond on port 53 (%d filtered out, %.0f%% reduction)\n" \
+            "$pre_alive" "$pre_total" "$pre_filtered" \
+            "$(python3 -c "print(${pre_filtered}/${pre_total}*100 if ${pre_total}>0 else 0)")"
+
+        if [ "$pre_alive" -eq 0 ]; then
+            printf "Warning: No IPs responded to DNS pre-filter. Running full scan instead.\n"
+        else
+            mv "${IP_FILE}.alive" "$IP_FILE"
+            ip_count=$pre_alive
+        fi
+        rm -f "${IP_FILE}.alive"
     fi
-    rm -f "${IP_FILE}.alive"
 fi
 
 # Setup
